@@ -1,0 +1,15 @@
+# 带单员监控配置。
+# 加人只需复制一段：portfolioId 取带单页 URL 末尾那串数字。
+pollSeconds: 60
+# 启动时回补多少天的订单来建立持仓账本（不推送）。
+bootstrapDays: 14
+# true 才会真的发 Telegram；shadow 阶段保持 false。
+push: true
+
+traders:
+  - id: aoying
+    portfolioId: "5075281354358777856"
+    label: 熬鹰资本
+    enabled: true
+    # 缺省继承全局 pollSeconds；这个人的交易节奏慢，60 秒足够。
+    pollSeconds: 60

@@ -1,0 +1,21 @@
+[Unit]
+Description=Binance lead trade radar (signal only)
+After=network-online.target
+
+[Service]
+Type=simple
+# %h 是当前用户 home；项目放在 %h/projects/lead-trade-radar 时无需改路径。
+WorkingDirectory=%h/projects/lead-trade-radar
+Environment=NODE_USE_ENV_PROXY=1
+Environment=HTTP_PROXY=http://127.0.0.1:7890
+Environment=HTTPS_PROXY=http://127.0.0.1:7890
+EnvironmentFile=-%h/projects/lead-trade-radar/.env
+# Node 路径按自己的安装位置改（nvm / 系统包都可能不同）。
+ExecStart=%h/.local/opt/node/bin/node --import tsx src/entry/run.ts
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
