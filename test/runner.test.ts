@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { BapiClient } from "../src/adapters/binance/bapi.ts";
 import { Store } from "../src/adapters/sqlite/store.ts";
 import { TelegramError } from "../src/adapters/telegram/client.ts";
-import { TraderRunner } from "../src/app/runner.ts";
+import { TraderRunner, describeError } from "../src/app/runner.ts";
 import type { ClosedPosition, LeadOrder, TraderDetail } from "../src/domain/types.ts";
 import { loadDetail, loadOrders, loadPositions } from "./helpers.ts";
 
@@ -283,6 +283,7 @@ describe("轮询编排", () => {
       traderConfig,
     );
     await healthy.bootstrapIfNeeded();
+    await healthy.cycle();
     const before = store.getTrader("aoying")!.lastSeenMs;
 
     const broken = new TraderRunner(
@@ -321,6 +322,40 @@ describe("轮询编排", () => {
     const alerts = store.listSignals(10).filter((row) => row.action === "alert");
     expect(alerts).toHaveLength(1);
     expect(alerts[0]!.text).toContain("连续 3 次");
+
+    // 恢复后补一条恢复通知，且只发一次。
+    const recovered = new TraderRunner(
+      {
+        store,
+        client: fakeClient(orders, positions, detail),
+        notifier: null,
+        push: false,
+        bootstrapDays: 14,
+        now: () => 1_794_600_180_000,
+        log: () => {},
+      },
+      traderConfig,
+    );
+    await recovered.cycle();
+    const recoveryAlerts = store
+      .listSignals(20)
+      .filter((row) => row.action === "alert" && row.text.includes("已恢复"));
+    expect(recoveryAlerts).toHaveLength(1);
+    expect(recoveryAlerts[0]!.text).toContain("中断约 3 分钟");
+    expect(recoveryAlerts[0]!.text).toContain("ECONNRESET");
+    await recovered.cycle();
+    expect(
+      store.listSignals(20).filter((row) => row.action === "alert" && row.text.includes("已恢复")),
+    ).toHaveLength(1);
     store.close();
+  });
+
+  it("告警展开 fetch failed 的底层 cause", () => {
+    const cause = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:7890"), { code: "ECONNREFUSED" });
+    const error = Object.assign(new TypeError("fetch failed"), { cause });
+    const text = describeError(error);
+    expect(text).toContain("fetch failed");
+    expect(text).toContain("ECONNREFUSED");
+    expect(text).toContain("127.0.0.1:7890");
   });
 });

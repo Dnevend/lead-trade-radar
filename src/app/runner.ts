@@ -36,6 +36,8 @@ export interface RunnerDeps {
 
 const OVERLAP_MS = 120_000;
 const BOOTSTRAP_SILENT = -1;
+/** 连续失败到这个次数才告警，避免一两次抖动刷屏。 */
+const FAILURE_ALERT_THRESHOLD = 3;
 
 export class TraderRunner {
   readonly ref: TraderRef;
@@ -322,11 +324,24 @@ export class TraderRunner {
       store.upsertTrader({ ...trader, lastSeenMs: lastSeen });
     }
 
+    // 从连续失败里恢复：补一条恢复通知，避免「信号中断」告警后一直悬着。
+    const recoveredAt = now();
+    const health = store.getHealth(traderId);
+    if (health.failures >= FAILURE_ALERT_THRESHOLD) {
+      const downMinutes =
+        health.lastOkAt === null ? null : Math.max(1, Math.round((recoveredAt - health.lastOkAt) / 60_000));
+      const previous = health.lastError ? `\n上次错误：${health.lastError.slice(0, 200)}` : "";
+      this.emitAlert(
+        `✅ ${this.trader.label} 拉取已恢复${downMinutes === null ? "" : `（中断约 ${downMinutes} 分钟）`}${previous}`,
+        `health|recovered|${health.lastOkAt ?? 0}`,
+      );
+    }
+
     if (push && notifier) {
       await this.flushOutbox();
     }
 
-    store.setHealth({ traderId, failures: 0, lastOkAt: now(), lastError: this.lastPushError });
+    store.setHealth({ traderId, failures: 0, lastOkAt: recoveredAt, lastError: this.lastPushError });
     return emitted;
   }
 
@@ -394,16 +409,17 @@ export class TraderRunner {
     const { store, now, log } = this.deps;
     const health = store.getHealth(this.trader.id);
     const failures = health.failures + 1;
+    const described = describeError(error);
     store.setHealth({
       traderId: this.trader.id,
       failures,
       lastOkAt: health.lastOkAt,
-      lastError: String(error),
+      lastError: described,
     });
-    log("轮询失败", { trader: this.trader.id, failures, error: String(error) });
-    if (failures === 3) {
+    log("轮询失败", { trader: this.trader.id, failures, error: described });
+    if (failures === FAILURE_ALERT_THRESHOLD) {
       this.emitAlert(
-        `⚠️ ${this.trader.label} 连续 3 次拉取失败，信号可能中断\n${String(error).slice(0, 200)}`,
+        `⚠️ ${this.trader.label} 连续 ${FAILURE_ALERT_THRESHOLD} 次拉取失败，信号可能中断\n${described.slice(0, 300)}`,
         `health|${now()}`,
       );
     }
@@ -470,4 +486,39 @@ function formatQty(value: number): string {
 
 function formatUsd(value: number): string {
   return `$${Math.round(value).toLocaleString("en-US")}`;
+}
+
+/**
+ * undici 的 `TypeError: fetch failed` 把真实原因藏在 cause 里（代理拒绝、DNS、TLS 等），
+ * 直接 String(error) 只剩一句无法排查的 “fetch failed”。这里沿 cause 链展开，
+ * 让告警和日志能直接看到 ECONNREFUSED / ENOTFOUND / 证书错误。
+ */
+export function describeError(error: unknown, maxDepth = 5): string {
+  const parts: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  for (let depth = 0; depth < maxDepth && current != null; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    const text = formatError(current);
+    if (text && !parts.includes(text)) {
+      parts.push(text);
+    }
+    current = typeof current === "object" ? (current as { cause?: unknown }).cause : undefined;
+  }
+  return parts.length > 0 ? parts.join(" <- ") : String(error);
+}
+
+function formatError(error: unknown): string {
+  if (error instanceof AggregateError) {
+    const inner = error.errors.map(formatError).filter(Boolean).join("；");
+    const head = error.message ? `${error.name}: ${error.message}` : error.name;
+    return inner ? `${head}（${inner}）` : head;
+  }
+  if (error instanceof Error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    const head = error.message ? `${error.name}: ${error.message}` : error.name;
+    return code && !head.includes(code) ? `${head} [${code}]` : head;
+  }
+  return String(error);
 }
