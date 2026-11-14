@@ -3,6 +3,7 @@ import type { BapiClient } from "../src/adapters/binance/bapi.ts";
 import { Store } from "../src/adapters/sqlite/store.ts";
 import { TelegramError } from "../src/adapters/telegram/client.ts";
 import { TraderRunner, describeError } from "../src/app/runner.ts";
+import type { Tweet } from "../src/domain/tweet.ts";
 import type { ClosedPosition, LeadOrder, TraderDetail } from "../src/domain/types.ts";
 import { loadDetail, loadOrders, loadPositions } from "./helpers.ts";
 
@@ -357,5 +358,211 @@ describe("轮询编排", () => {
     expect(text).toContain("fetch failed");
     expect(text).toContain("ECONNREFUSED");
     expect(text).toContain("127.0.0.1:7890");
+  });
+});
+
+function xTweet(id: string, text = `tweet ${id}`): Tweet {
+  return {
+    id,
+    text,
+    createdAt: 1_794_600_000_000,
+    url: `https://x.com/thankUcrypto/status/${id}`,
+    authorHandle: "thankUcrypto",
+    replyTo: null,
+    repostedBy: null,
+    media: [],
+  };
+}
+
+function newLeadOrder(lastSeen: number, offset = 1_000): LeadOrder {
+  return {
+    symbol: "ETHUSDT",
+    baseAsset: "ETH",
+    quoteAsset: "USDT",
+    side: "SELL",
+    positionSide: "SHORT",
+    type: "MARKET",
+    executedQty: 10,
+    avgPrice: 2_000,
+    totalPnl: 0,
+    orderTime: lastSeen + offset,
+    orderUpdateTime: lastSeen + offset,
+  };
+}
+
+describe("信号后补推 X 推文", () => {
+  it("信号先发、推文后发，按游标去重且只发原创/自引", async () => {
+    const store = new Store(":memory:");
+    const positions = loadPositions();
+    const orders = loadOrders();
+    const detail = loadDetail();
+    const sent: string[] = [];
+    const xCalls: string[] = [];
+    let clock = 1_794_600_000_000;
+    let currentOrders = orders;
+    let feed: Tweet[] = [xTweet("2121593758101942700")];
+
+    const client = {
+      async fetchDetail() {
+        return detail;
+      },
+      async fetchClosedPositions() {
+        return positions;
+      },
+      async fetchOrders() {
+        return currentOrders;
+      },
+      async fetchTransfers() {
+        return [];
+      },
+    } as unknown as BapiClient;
+
+    const runner = new TraderRunner(
+      {
+        store,
+        client,
+        notifier: {
+          async sendMessage(text: string) {
+            sent.push(text);
+            return { messageId: sent.length };
+          },
+        },
+        push: true,
+        bootstrapDays: 14,
+        now: () => clock,
+        log: () => {},
+        tweetSource: {
+          async fetchRecentTweets(handle: string) {
+            xCalls.push(handle);
+            return feed;
+          },
+        },
+      },
+      { id: "aoying", portfolioId: detail.leadPortfolioId, label: detail.nickname, enabled: true, xHandle: "thankUcrypto" },
+    );
+
+    await runner.bootstrapIfNeeded();
+    clock += 10_000;
+    expect(await runner.cycle()).toHaveLength(0);
+    // 第一次运行只建立基线，不补发历史
+    expect(xCalls).toEqual(["thankUcrypto"]);
+    expect(store.getTweetState("aoying")).toEqual({ lastTweetId: "2121593758101942700", pendingSince: null });
+    expect(sent).toHaveLength(0);
+
+    // 新订单 + 两条新推文 + 别人的回复/转推：推文应过滤后按时间升序合并且在信号之后
+    const lastSeen = store.getTrader("aoying")!.lastSeenMs;
+    currentOrders = [...orders, newLeadOrder(lastSeen)];
+    feed = [
+      xTweet("2121593758101942703", "别人的回复"),
+      xTweet("2121593758101942702", "第二条"),
+      xTweet("2121593758101942701", "第一条"),
+      xTweet("2121593758101942700"),
+    ];
+    feed[0] = { ...feed[0]!, authorHandle: "someone", replyTo: "thankUcrypto" };
+    feed.push({ ...xTweet("2121593758101942704", "转推"), authorHandle: "heyibinance", repostedBy: "thankUcrypto" });
+
+    clock += 100_000;
+    const emitted = await runner.cycle();
+    expect(emitted).toHaveLength(1);
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toContain("开空 ETHUSDT");
+    expect(sent[1]).toContain("新推文 2 条");
+    expect(sent[1]!.indexOf("第一条")).toBeLessThan(sent[1]!.indexOf("第二条"));
+    expect(sent[1]).not.toContain("别人的回复");
+    expect(sent[1]).not.toContain("转推");
+    expect(store.getTweetState("aoying")).toEqual({ lastTweetId: "2121593758101942704", pendingSince: null });
+
+    // 没有新订单、没有新推文：不重复发送
+    clock += 100_000;
+    expect(await runner.cycle()).toHaveLength(0);
+    expect(sent).toHaveLength(2);
+    store.close();
+  });
+
+  it("推文拉取失败不影响信号，冷却后重试", async () => {
+    const store = new Store(":memory:");
+    const positions = loadPositions();
+    const orders = loadOrders();
+    const detail = loadDetail();
+    const sent: string[] = [];
+    let clock = 1_794_600_000_000;
+    let currentOrders = orders;
+    let feed: Tweet[] = [xTweet("2121593758101942800")];
+    let fail = false;
+    let xCalls = 0;
+
+    const client = {
+      async fetchDetail() {
+        return detail;
+      },
+      async fetchClosedPositions() {
+        return positions;
+      },
+      async fetchOrders() {
+        return currentOrders;
+      },
+      async fetchTransfers() {
+        return [];
+      },
+    } as unknown as BapiClient;
+
+    const runner = new TraderRunner(
+      {
+        store,
+        client,
+        notifier: {
+          async sendMessage(text: string) {
+            sent.push(text);
+            return { messageId: sent.length };
+          },
+        },
+        push: true,
+        bootstrapDays: 14,
+        now: () => clock,
+        log: () => {},
+        tweetSource: {
+          async fetchRecentTweets() {
+            xCalls += 1;
+            if (fail) {
+              throw new Error("fx down");
+            }
+            return feed;
+          },
+        },
+      },
+      { id: "aoying", portfolioId: detail.leadPortfolioId, label: detail.nickname, enabled: true, xHandle: "thankUcrypto" },
+    );
+
+    await runner.bootstrapIfNeeded();
+    clock += 10_000;
+    await runner.cycle();
+    expect(store.getTweetState("aoying").lastTweetId).toBe("2121593758101942800");
+
+    // 新信号 + 推文接口故障：信号照常送达，推文标记待补
+    const lastSeen = store.getTrader("aoying")!.lastSeenMs;
+    currentOrders = [...orders, newLeadOrder(lastSeen)];
+    fail = true;
+    feed = [xTweet("2121593758101942801"), xTweet("2121593758101942800")];
+    clock += 100_000;
+    await runner.cycle();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("开空 ETHUSDT");
+    expect(store.getTweetState("aoying").pendingSince).not.toBeNull();
+
+    // 冷却期内不重复打接口
+    const callsAfterFailure = xCalls;
+    clock += 60_000;
+    await runner.cycle();
+    expect(xCalls).toBe(callsAfterFailure);
+
+    // 冷却结束后补推
+    fail = false;
+    clock += 6 * 60_000;
+    await runner.cycle();
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toContain("新推文 1 条");
+    expect(store.getTweetState("aoying")).toEqual({ lastTweetId: "2121593758101942801", pendingSince: null });
+    expect(store.listPendingSignals()).toHaveLength(0);
+    store.close();
   });
 });

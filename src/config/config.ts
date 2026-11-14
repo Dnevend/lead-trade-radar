@@ -12,6 +12,13 @@ const traderSchema = z.object({
   label: z.string().min(1),
   enabled: z.boolean().default(true),
   pollSeconds: z.number().int().min(30).optional(),
+  /** X 用户名（不带 @）；填了才会在信号推送成功后附带他的新推文。 */
+  xHandle: z
+    .string()
+    .regex(/^[A-Za-z0-9_]{1,15}$/, "xHandle 只能是 1-15 位字母、数字或下划线")
+    .optional(),
+  /** 单次最多推送多少条新推文；超出的更早推文跳过。 */
+  xMaxTweetsPerPush: z.number().int().min(1).max(50).optional(),
 });
 
 const configSchema = z.object({

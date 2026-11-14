@@ -57,6 +57,11 @@ export function loadDetail(): TraderDetail {
   };
 }
 
+/** fxtwitter 的公开响应；只用于离线解析测试。 */
+export function loadXStatuses(): unknown {
+  return read("x-statuses.json");
+}
+
 export function sortedOrders(): LeadOrder[] {
   return loadOrders().sort((a, b) => a.orderUpdateTime - b.orderUpdateTime || a.orderTime - b.orderTime);
 }

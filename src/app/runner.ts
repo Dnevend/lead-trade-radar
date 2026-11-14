@@ -6,13 +6,14 @@
  */
 
 import type { BapiClient } from "../adapters/binance/bapi.ts";
-import type { Store } from "../adapters/sqlite/store.ts";
+import type { SignalRow, Store } from "../adapters/sqlite/store.ts";
 import { TelegramError } from "../adapters/telegram/client.ts";
 import type { TraderConfig } from "../config/config.ts";
 import { applyAnchor, applyOrder, createLedger, type Ledger } from "../domain/ledger.ts";
 import { orderBaseKey, orderDedupeKey } from "../domain/order.ts";
-import { renderOrderSignal } from "../domain/render.ts";
+import { renderOrderSignal, renderTweetDigest } from "../domain/render.ts";
 import { buildOrderSignal, type TraderRef } from "../domain/signal.ts";
+import { compareTweetIds, eligibleTweets, newestTweetId, newTweetsSince, type TweetSource } from "../domain/tweet.ts";
 import type { ClosedPosition, LeadOrder, TraderDetail, TransferRecord } from "../domain/types.ts";
 import type { DepthSnapshot } from "../domain/followability.ts";
 
@@ -32,12 +33,20 @@ export interface RunnerDeps {
   priceOf?: (symbol: string) => Promise<number | null>;
   /** 盘口深度；只用于流动性提示，失败不影响信号。 */
   depthOf?: (symbol: string) => Promise<DepthSnapshot | null>;
+  /** X 推文数据源；失败只记日志，不影响信号送达。 */
+  tweetSource?: TweetSource | null;
 }
 
 const OVERLAP_MS = 120_000;
 const BOOTSTRAP_SILENT = -1;
 /** 连续失败到这个次数才告警，避免一两次抖动刷屏。 */
 const FAILURE_ALERT_THRESHOLD = 3;
+/** 推文接口失败后的重试间隔：避免每轮都打第三方接口。 */
+const TWEET_RETRY_MS = 5 * 60_000;
+/** 触发补推 X 推文的信号动作；告警和推文自身不触发。 */
+const TRIGGER_ACTIONS = new Set(["open", "add", "reduce", "close", "transfer"]);
+/** 单次推送推文条数上限的默认值（配置里没写时）。 */
+const DEFAULT_MAX_TWEETS = 10;
 
 export class TraderRunner {
   readonly ref: TraderRef;
@@ -45,6 +54,8 @@ export class TraderRunner {
   private lastDetail: TraderDetail | null = null;
   private lastStatus: string | null = null;
   private lastPushError: string | null = null;
+  /** 推文接口失败后的冷却截止时间。 */
+  private tweetRetryAt = 0;
 
   constructor(
     private readonly deps: RunnerDeps,
@@ -339,6 +350,7 @@ export class TraderRunner {
 
     if (push && notifier) {
       await this.flushOutbox();
+      await this.pushDueTweets();
     }
 
     store.setHealth({ traderId, failures: 0, lastOkAt: recoveredAt, lastError: this.lastPushError });
@@ -364,17 +376,19 @@ export class TraderRunner {
     }
   }
 
-  /** 发件箱：把所有尚未发送的信号补发出去；失败的下轮再试。 */
-  async flushOutbox(): Promise<void> {
+  /** 发件箱：把所有尚未发送的信号补发出去；失败的下轮再试。返回本轮真正送达的行。 */
+  async flushOutbox(): Promise<SignalRow[]> {
     const { store, notifier, now, log } = this.deps;
+    const sent: SignalRow[] = [];
     if (!notifier) {
-      return;
+      return sent;
     }
     const pending = store.listPendingSignals(50);
     for (const row of pending) {
       try {
         const result = await notifier.sendMessage(row.text);
         store.markSent(row.traderId, row.dedupeKey, now(), result.messageId);
+        sent.push(row);
         this.lastPushError = null;
       } catch (error) {
         this.lastPushError = String(error);
@@ -387,6 +401,94 @@ export class TraderRunner {
         log("发送失败，留在 outbox", { trader: row.traderId, error: String(error) });
         break;
       }
+    }
+
+    // 只有交易信号真正送达才补推文；健康告警、推文自身都不触发。
+    // 按 trader 标记而不是只看自己：多交易员时别的 runner 可能先 flush 走我的信号。
+    if (this.deps.push) {
+      const due = new Set(
+        sent.filter((row) => TRIGGER_ACTIONS.has(row.action)).map((row) => row.traderId),
+      );
+      for (const traderId of due) {
+        store.markTweetsPending(traderId, now());
+      }
+    }
+    return sent;
+  }
+
+  /**
+   * 信号推送成功后，补推他 X 上「上次之后」的新推文（docs/spec.md §6.1）。
+   * 首次运行只建立基线，不补历史；拉取失败保留 pending_since，冷却后重试。
+   */
+  private async pushDueTweets(): Promise<void> {
+    const { store, now, log, tweetSource, push, notifier } = this.deps;
+    const handle = this.trader.xHandle;
+    if (!handle || !tweetSource || !push || !notifier) {
+      return;
+    }
+    const traderId = this.trader.id;
+    const state = store.getTweetState(traderId);
+    if (state.lastTweetId !== null && state.pendingSince === null) {
+      return;
+    }
+    const at = now();
+    if (at < this.tweetRetryAt) {
+      return;
+    }
+
+    try {
+      const all = await tweetSource.fetchRecentTweets(handle);
+      const newest = newestTweetId(all);
+      if (newest === null) {
+        store.saveTweetState(traderId, { lastTweetId: state.lastTweetId, pendingSince: null });
+        return;
+      }
+
+      // 首次运行：把游标对齐到当前最新一条，避免部署时一次性补发历史。
+      if (state.lastTweetId === null) {
+        store.saveTweetState(traderId, { lastTweetId: newest, pendingSince: null });
+        log("推文基线已建立", { trader: traderId, handle, newest });
+        return;
+      }
+
+      // 接口返回的推文可能比本地游标旧（缓存/重放），游标只前进不后退。
+      const nextCursor = compareTweetIds(newest, state.lastTweetId) > 0 ? newest : state.lastTweetId;
+      const { selected, skipped } = newTweetsSince(
+        eligibleTweets(all, handle),
+        state.lastTweetId,
+        this.trader.xMaxTweetsPerPush ?? DEFAULT_MAX_TWEETS,
+      );
+
+      if (selected.length === 0) {
+        store.saveTweetState(traderId, { lastTweetId: nextCursor, pendingSince: null });
+        return;
+      }
+
+      const messages = renderTweetDigest({ label: this.trader.label, handle, tweets: selected });
+      store.transaction(() => {
+        for (const message of messages) {
+          const first = message.tweets[0]!;
+          const last = message.tweets[message.tweets.length - 1]!;
+          store.insertSignal({
+            traderId,
+            dedupeKey: `tweet|${first.id}-${last.id}`,
+            action: "tweet",
+            text: message.text,
+            createdAt: now(),
+            sentAt: null,
+            messageId: null,
+          });
+        }
+        store.saveTweetState(traderId, { lastTweetId: nextCursor, pendingSince: null });
+      });
+      this.tweetRetryAt = 0;
+      log("推文入队", { trader: traderId, handle, count: selected.length, skipped, messages: messages.length });
+
+      // 推文排在信号之后：这里再 flush 一次，保证顺序且复用同一套失败重试。
+      await this.flushOutbox();
+    } catch (error) {
+      this.tweetRetryAt = now() + TWEET_RETRY_MS;
+      log("推文拉取失败，稍后重试", { trader: traderId, handle, error: describeError(error) });
     }
   }
 

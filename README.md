@@ -10,6 +10,7 @@
 - 带单员隐藏持仓（`positionShow=false`）也能跟：站内订单流是公开的。
 - 用订单流重建推定持仓，用已平仓位记录校准锚点。
 - 平仓消息带杠杆、ROI、持有时间。
+- 可配置在信号推送成功后，补推该带单员 X 上的新推文（按推文 ID 去重，不重复刷屏）。
 - 多人配置；首次启动静默建基线，不刷屏。
 - 接口字段变化、连续拉取失败（带底层网络原因）、恢复、带单员停单都会告警。
 
@@ -28,6 +29,9 @@ npm run replay
 
 # 影子期统计：延迟 p50/p90、信号量、推定持仓
 npm run stats
+
+# 预览配置的 X 账号最近推文（只打印，不发、不写库）
+npm run tweets
 ```
 
 ## 配置
@@ -44,6 +48,8 @@ traders:
     portfolioId: "5075281354358777856"   # 带单页 URL 末尾的数字
     label: 熬鹰资本
     enabled: true
+    xHandle: thankUcrypto               # 可选：信号推送后补推他的 X 新推文
+    xMaxTweetsPerPush: 10               # 可选：单次最多合并几条，默认 10
 ```
 
 `portfolioId` 取 `https://www.binance.com/zh-CN/copy-trading/lead-details/<这串数字>`。
@@ -76,7 +82,8 @@ journalctl --user -u lead-trade-radar -f
 
 - `test/fixtures/` 是 2026-11-14 从币安带单页抓的**公开数据**，包含带单员公开昵称、
   portfolioId 与已成交委托字段，仅用于离线回放测试，不代表任何投资建议。
-- 本项目与币安无关联；接口是站内未公开接口，没有 SLA，可能随时失效。
+- `test/fixtures/x-statuses.json` 是同日从 fxtwitter 公开接口抓的推文，仅用于解析测试。
+- 本项目与币安、X 无关联；币安站内接口与 fxtwitter 镜像都是第三方服务，没有 SLA，可能随时失效。
 - 只做信号呈报，不下单、不持有交易 API Key、不计算建议仓位。交易风险自负。
 
 ## 开发
@@ -99,4 +106,5 @@ npm test          # 离线，用 test/fixtures 里的真实响应回放
 | `SchemaChangedError` | 币安字段变了，先看 `docs/spec.md §2` 和原始响应，改适配器与 fixture |
 | `全部端点不可用` | 检查代理；确认 `friendly` 路径是否也失效（`public` 已失效） |
 | 消息延迟很大 | 看消息里的「延迟 Ns」，这是币安发布延迟 + 轮询间隔 |
+| 推文不推送 | 确认该交易员配了 `xHandle`、`push: true`；跑 `npm run tweets` 检查代理与接口，日志搜「推文拉取失败」 |
 | 重启后不补发 | 设计如此；需要补发就删 `var/radar.sqlite` 里的 `lead_order` 行 |

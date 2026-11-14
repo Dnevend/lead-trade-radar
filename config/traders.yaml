@@ -13,3 +13,7 @@ traders:
     enabled: true
     # 缺省继承全局 pollSeconds；这个人的交易节奏慢，60 秒足够。
     pollSeconds: 60
+    # 信号推送成功后，再推他 X 上的新推文（原创 + 自引线程，按 ID 去重）。
+    xHandle: thankUcrypto
+    # 单次最多合并推送多少条新推文；超出的更早推文跳过。
+    xMaxTweetsPerPush: 10

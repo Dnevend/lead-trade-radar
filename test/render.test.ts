@@ -1,8 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { renderOrderSignal } from "../src/domain/render.ts";
+import { renderOrderSignal, renderTweetDigest } from "../src/domain/render.ts";
 import { buildOrderSignal, matchClosedPosition } from "../src/domain/signal.ts";
 import { renderTransfer } from "../src/app/runner.ts";
+import type { Tweet } from "../src/domain/tweet.ts";
 import { loadDetail, loadPositions, sortedOrders } from "./helpers.ts";
+
+function makeTweet(id: string, text: string, createdAt: number, media: Tweet["media"] = []): Tweet {
+  return {
+    id,
+    text,
+    createdAt,
+    url: `https://x.com/thankUcrypto/status/${id}`,
+    authorHandle: "thankUcrypto",
+    replyTo: null,
+    repostedBy: null,
+    media,
+  };
+}
 
 describe("信号渲染", () => {
   it("开仓消息包含方向、名义额和保证金占比", () => {
@@ -135,5 +149,59 @@ describe("信号渲染", () => {
     expect(text).toContain("流动性 差");
     expect(text).toContain("0.1% 深度");
     expect(text).toContain("极短线");
+  });
+});
+
+describe("推文摘要渲染", () => {
+  it("多条推文合并成一条，保留时间、正文、媒体和原链接", () => {
+    const messages = renderTweetDigest({
+      label: "熬鹰资本",
+      handle: "thankUcrypto",
+      tweets: [
+        makeTweet("2121287435242058003", "MSTR被移出指数前，买了点PUT。", Date.UTC(2026, 10, 13, 17, 1, 50), [
+          { type: "photo" },
+        ]),
+        makeTweet("2121593758101942747", "周末的暴跌可以抄，周末的阴跌不能碰。", Date.UTC(2026, 10, 14, 13, 19, 3)),
+      ],
+    });
+
+    expect(messages).toHaveLength(1);
+    const text = messages[0]!.text;
+    expect(text).toContain("🐦 熬鹰资本 · @thankUcrypto 新推文 2 条");
+    expect(text).toContain("2026-11-14 01:01:50");
+    expect(text).toContain("（1 张图）");
+    expect(text).toContain("https://x.com/thankUcrypto/status/2121287435242058003");
+    expect(text.indexOf("MSTR")).toBeLessThan(text.indexOf("周末的暴跌"));
+    expect(messages[0]!.tweets.map((tweet) => tweet.id)).toEqual([
+      "2121287435242058003",
+      "2121593758101942747",
+    ]);
+  });
+
+  it("超过长度上限时按推文边界拆成多条，链接不丢", () => {
+    const tweets = [
+      makeTweet("1", "长".repeat(300), 1_794_600_000_000),
+      makeTweet("2", "长".repeat(300), 1_794_600_001_000),
+      makeTweet("3", "长".repeat(300), 1_794_600_002_000),
+    ];
+    const messages = renderTweetDigest({ label: "熬鹰资本", handle: "thankUcrypto", tweets, maxLength: 700 });
+    expect(messages.length).toBeGreaterThan(1);
+    expect(messages.flatMap((message) => message.tweets.map((tweet) => tweet.id))).toEqual(["1", "2", "3"]);
+    for (const message of messages) {
+      expect(message.text.length).toBeLessThanOrEqual(700);
+      expect(message.text).toMatch(/新推文（\d+\/\d+）/);
+      for (const tweet of message.tweets) {
+        expect(message.text).toContain(tweet.url);
+      }
+    }
+  });
+
+  it("单条推文超长时截断正文但保留链接", () => {
+    const tweet = makeTweet("2121593758101942747", "长".repeat(5_000), 1_794_662_343_000);
+    const messages = renderTweetDigest({ label: "熬鹰资本", handle: "thankUcrypto", tweets: [tweet], maxLength: 1_000 });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.text.length).toBeLessThanOrEqual(1_000);
+    expect(messages[0]!.text).toContain("…");
+    expect(messages[0]!.text).toContain(tweet.url);
   });
 });

@@ -38,6 +38,12 @@ export interface HealthRow {
   lastError: string | null;
 }
 
+/** X 推文游标：last_tweet_id 为空表示还没建立基线；pending_since 非空表示有信号已发、等待补推文。 */
+export interface TweetState {
+  lastTweetId: string | null;
+  pendingSince: number | null;
+}
+
 /** 一笔委托的当前快照；用于区分「同一委托补量」和「同毫秒的新委托」。 */
 export interface OrderSnapshot {
   fingerprint: string;
@@ -127,6 +133,14 @@ const MIGRATIONS = [
   CREATE INDEX order_snapshot_base ON order_snapshot(trader_id, base_key);
   DROP TABLE IF EXISTS order_cursor;
   ALTER TABLE ledger ADD COLUMN last_increase_at INTEGER NOT NULL DEFAULT 0;
+  `,
+  `
+  CREATE TABLE IF NOT EXISTS tweet_state (
+    trader_id TEXT PRIMARY KEY,
+    last_tweet_id TEXT,
+    pending_since INTEGER,
+    updated_at INTEGER NOT NULL
+  );
   `,
 ];
 
@@ -363,12 +377,48 @@ export class Store {  private readonly db: DatabaseSync;
     return rows.map(mapSignal);
   }
 
-  /** 所有待发送信号，按创建时间升序。 */
+  /** 所有待发送信号，按创建时间升序；同一毫秒内按插入顺序，保证多条推文消息顺序稳定。 */
   listPendingSignals(limit = 50): SignalRow[] {
     const rows = this.db
-      .prepare("SELECT * FROM signal WHERE sent_at IS NULL ORDER BY created_at ASC LIMIT ?")
+      .prepare("SELECT * FROM signal WHERE sent_at IS NULL ORDER BY created_at ASC, rowid ASC LIMIT ?")
       .all(limit) as Array<Record<string, unknown>>;
     return rows.map(mapSignal);
+  }
+
+  getTweetState(traderId: string): TweetState {
+    const row = this.db.prepare("SELECT * FROM tweet_state WHERE trader_id = ?").get(traderId) as
+      | Record<string, unknown>
+      | undefined;
+    return {
+      lastTweetId: row?.last_tweet_id == null ? null : String(row.last_tweet_id),
+      pendingSince: row?.pending_since == null ? null : Number(row.pending_since),
+    };
+  }
+
+  saveTweetState(traderId: string, state: TweetState): void {
+    this.db
+      .prepare(
+        `INSERT INTO tweet_state (trader_id, last_tweet_id, pending_since, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(trader_id) DO UPDATE SET
+           last_tweet_id = excluded.last_tweet_id,
+           pending_since = excluded.pending_since,
+           updated_at = excluded.updated_at`,
+      )
+      .run(traderId, state.lastTweetId, state.pendingSince, Date.now());
+  }
+
+  /** 信号已真正发出：标记下一次 cycle 需要补推文。 */
+  markTweetsPending(traderId: string, at: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO tweet_state (trader_id, last_tweet_id, pending_since, updated_at)
+         VALUES (?, NULL, ?, ?)
+         ON CONFLICT(trader_id) DO UPDATE SET
+           pending_since = excluded.pending_since,
+           updated_at = excluded.updated_at`,
+      )
+      .run(traderId, at, Date.now());
   }
 
   getHealth(traderId: string): HealthRow {

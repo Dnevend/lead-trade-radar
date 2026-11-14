@@ -13,6 +13,7 @@ import { BapiClient, BapiError } from "../adapters/binance/bapi.ts";
 import { createDepthFetcher, createMarkPriceFetcher } from "../adapters/binance/market.ts";
 import { Store } from "../adapters/sqlite/store.ts";
 import { TelegramClient } from "../adapters/telegram/client.ts";
+import { FxTwitterClient } from "../adapters/x/client.ts";
 import { TraderRunner } from "../app/runner.ts";
 import { loadConfig, pollMsOf, type TraderConfig } from "../config/config.ts";
 
@@ -27,6 +28,7 @@ const store = new Store(dbPath);
 const client = new BapiClient({ fetch });
 const priceOf = createMarkPriceFetcher(fetch);
 const depthOf = createDepthFetcher(fetch);
+const tweetSource = new FxTwitterClient({ fetch });
 const notifier =
   push && process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID
     ? new TelegramClient({
@@ -57,7 +59,7 @@ const enabledTraders = config.traders
 const runners = enabledTraders.map(
   (trader) =>
     new TraderRunner(
-      { store, client, notifier, push, bootstrapDays: config.bootstrapDays, now: Date.now, log, priceOf, depthOf },
+      { store, client, notifier, push, bootstrapDays: config.bootstrapDays, now: Date.now, log, priceOf, depthOf, tweetSource },
       trader,
     ),
 );

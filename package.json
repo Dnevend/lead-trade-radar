@@ -12,6 +12,7 @@
     "test": "vitest run",
     "start": "NODE_USE_ENV_PROXY=1 HTTPS_PROXY=${HTTPS_PROXY:-http://127.0.0.1:7890} tsx src/entry/run.ts",
     "once": "NODE_USE_ENV_PROXY=1 HTTPS_PROXY=${HTTPS_PROXY:-http://127.0.0.1:7890} tsx src/entry/once.ts",
+    "tweets": "NODE_USE_ENV_PROXY=1 HTTPS_PROXY=${HTTPS_PROXY:-http://127.0.0.1:7890} tsx src/entry/tweets.ts",
     "replay": "tsx src/entry/replay.ts",
     "stats": "tsx src/entry/stats.ts"
   },

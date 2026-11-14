@@ -6,6 +6,7 @@
 
 import type { Action } from "./order.ts";
 import type { OrderSignal } from "./signal.ts";
+import type { Tweet, TweetMedia } from "./tweet.ts";
 import type { Direction } from "./types.ts";
 const TZ = "Asia/Shanghai";
 
@@ -85,6 +86,95 @@ export function renderOrderSignal(signal: OrderSignal): string {
   const delaySec = Math.max(0, Math.round((signal.detectedAt - order.orderUpdateTime) / 1000));
   lines.push(`${fmtTime(order.orderUpdateTime)} · 延迟 ${delaySec}s`);
   return lines.join("\n");
+}
+
+export interface RenderedTweetDigest {
+  text: string;
+  /** 这条消息包含的推文，用于生成稳定的去重键。 */
+  tweets: Tweet[];
+}
+
+/**
+ * X 推文摘要（docs/spec.md §7.1）：多条合并成一条消息，按推文边界拆分成多条。
+ * 单条推文超长时只截断正文，时间和原链接一定保留。
+ */
+export function renderTweetDigest(params: {
+  label: string;
+  handle: string;
+  tweets: Tweet[];
+  /** Telegram 单条上限 4096；默认留出安全余量。 */
+  maxLength?: number;
+}): RenderedTweetDigest[] {
+  const { label, handle, tweets } = params;
+  if (tweets.length === 0) {
+    return [];
+  }
+  const limit = params.maxLength ?? 3800;
+  // 预留标题长度，避免拼接后超过 Telegram 上限。
+  const budget = limit - 80;
+  const blocks = tweets.map((tweet) => renderTweetBlock(tweet, budget));
+
+  const chunks: Array<{ tweets: Tweet[]; blocks: string[] }> = [];
+  let current: { tweets: Tweet[]; blocks: string[] } = { tweets: [], blocks: [] };
+  let currentLength = 0;
+  for (let index = 0; index < tweets.length; index += 1) {
+    const block = blocks[index]!;
+    const extra = current.blocks.length === 0 ? block.length : block.length + 2;
+    if (current.blocks.length > 0 && currentLength + extra > budget) {
+      chunks.push(current);
+      current = { tweets: [], blocks: [] };
+      currentLength = 0;
+    }
+    current.tweets.push(tweets[index]!);
+    current.blocks.push(block);
+    currentLength += current.blocks.length === 1 ? block.length : block.length + 2;
+  }
+  if (current.blocks.length > 0) {
+    chunks.push(current);
+  }
+
+  return chunks.map((chunk, index) => {
+    const header =
+      chunks.length === 1
+        ? `🐦 ${label} · @${handle} 新推文 ${tweets.length} 条`
+        : `🐦 ${label} · @${handle} 新推文（${index + 1}/${chunks.length}）`;
+    return { text: `${header}\n\n${chunk.blocks.join("\n\n")}`, tweets: chunk.tweets };
+  });
+}
+
+function renderTweetBlock(tweet: Tweet, maxLength?: number): string {
+  const time = fmtTime(tweet.createdAt);
+  const media = mediaLabel(tweet.media);
+  const text = tweet.text.trim();
+  const fixed = [time, media, tweet.url].filter((line) => line.length > 0).join("\n");
+
+  if (maxLength !== undefined && fixed.length + 2 + text.length > maxLength) {
+    const textBudget = Math.max(20, maxLength - fixed.length - 2);
+    return [time, truncate(text, textBudget), media, tweet.url].filter((line) => line.length > 0).join("\n");
+  }
+  return [time, text, media, tweet.url].filter((line) => line.length > 0).join("\n");
+}
+
+function mediaLabel(media: TweetMedia[]): string {
+  if (media.length === 0) {
+    return "";
+  }
+  if (media.some((item) => item.type === "video" || item.type === "gif" || item.type === "animated_gif")) {
+    return "（含视频）";
+  }
+  return `（${media.length} 张图）`;
+}
+
+function truncate(text: string, maxLength: number): string {
+  if (text.length <= maxLength) {
+    return text;
+  }
+  let cut = text.slice(0, Math.max(0, maxLength - 1));
+  // 不要把 emoji 的代理对切成两半。
+  if (/[\uD800-\uDBFF]$/.test(cut)) {
+    cut = cut.slice(0, -1);
+  }
+  return `${cut}…`;
 }
 
 export function fmtNumber(value: number): string {

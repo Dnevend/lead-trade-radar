@@ -57,6 +57,24 @@ describe("SQLite 存储", () => {
     store.close();
   });
 
+  it("推文游标和待补标记可往返", () => {
+    const store = new Store(":memory:");
+    expect(store.getTweetState("t1")).toEqual({ lastTweetId: null, pendingSince: null });
+
+    store.saveTweetState("t1", { lastTweetId: "2121593758101942747", pendingSince: null });
+    expect(store.getTweetState("t1")).toEqual({ lastTweetId: "2121593758101942747", pendingSince: null });
+
+    store.markTweetsPending("t1", 123);
+    expect(store.getTweetState("t1")).toEqual({ lastTweetId: "2121593758101942747", pendingSince: 123 });
+
+    // 标记待补不能清掉已有游标
+    expect(store.getTweetState("t1").lastTweetId).toBe("2121593758101942747");
+
+    store.saveTweetState("t1", { lastTweetId: "2121593758101942748", pendingSince: null });
+    expect(store.getTweetState("t1")).toEqual({ lastTweetId: "2121593758101942748", pendingSince: null });
+    store.close();
+  });
+
   it("账本落盘后可恢复", () => {
     const store = new Store(":memory:");
     const ledger = new Map([

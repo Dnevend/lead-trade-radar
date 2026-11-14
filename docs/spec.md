@@ -22,6 +22,7 @@
 | 已平仓位 | `POST .../lead-portfolio/position-history` | 含开/平时间、均价、盈亏、杠杆、ROI |
 | 资金划转 | `POST .../lead-portfolio/transfer-history` | 入金/出金 |
 | 带单员详情 | `GET .../lead-portfolio/detail?portfolioId=` | 昵称、状态、保证金余额、是否公开持仓 |
+| X 推文 | `GET https://api.fxtwitter.com/2/profile/<handle>/statuses` | 第三方公开镜像，无需鉴权；仅在配置 `xHandle` 时使用 |
 
 风险与对策：
 
@@ -30,6 +31,8 @@
 3. **没有 SLA**。每轮独立失败，失败不推进游标，下一轮重拉同一窗口。
 4. **请求头**必须带 `clienttype: web`、`origin`、`referer`（带 portfolioId）和浏览器 UA，否则被判非法请求。
 5. 需要代理（国内 DNS 污染），Node 用 `NODE_USE_ENV_PROXY=1` + `HTTPS_PROXY`。
+6. X 官方接口需要登录态、查询 ID 会轮换，推文改走公开镜像 fxtwitter。它是第三方服务，没有 SLA；
+   拉取失败只记日志并保留待补标记，不影响交易信号。
 
 ### §2.1 订单字段
 
@@ -109,7 +112,7 @@
 | 短线警告 | 同币种历史平仓中位持有时间 <60 分钟（<15 分钟标「极短线」），样本 ≥3 笔 |
 | 延迟 | `detectedAt − orderUpdateTime` |
 
-另外两类消息：
+另外三类消息：
 
 - **资金划转**：`transfer-history` 新增记录时推一条。若当时存在推定持仓，升级为风险提示：
   - 入金 →「持仓中补保证金」：他能加保证金扛单，跟随者没有等价操作。
@@ -117,6 +120,19 @@
 - **健康告警**：连续 3 次拉取失败（附 `fetch failed` 的底层 cause，如 ECONNREFUSED /
   ENOTFOUND）、带单员状态变化（如项目关闭）。恢复后再发一条「已恢复」（带中断时长和上次错误），
   避免告警后一直悬着。项目关闭的告警用稳定去重键，只发一次；该项目写入 `disabled_reason`，重启后不再排程。
+- **X 推文**：配置了 `xHandle` 的交易员，在一条 order / transfer 信号**真正送达**后，
+  补推他 X 上「上次已推之后」的新推文。见 §6.1。
+
+### §6.1 X 推文
+
+- 只保留原创、自引线程和引用帖；他与别人的来回回复、转推都不推。
+- 推文 ID 是 19 位十进制数，超出 JS 安全整数，游标按字符串存、用 BigInt 比较。
+- 首次运行只把游标对齐到当前最新一条，不补历史；之后只推 ID 大于游标的推文。
+- 单次最多 `xMaxTweetsPerPush` 条（默认 10）；超出的**更早**推文跳过并记日志。
+- 多条合并成一条消息，按推文边界拆成多条，单条上限 3800 字；超长单条只截断正文，时间与链接保留。
+- 同一轮里信号先发、推文后发；推文写入同一 outbox，发送失败下轮补发。
+- 拉取失败只记日志、保留 `pending_since`，5 分钟后重试；不影响交易信号送达。
+- fxtwitter 实测会偶发瞬时 404：客户端内部先做 2 次短重试（400ms/800ms），仍失败才进入冷却。
 
 ## §7 渲染
 
@@ -165,9 +181,29 @@
 
 动作图标：开 🟢 / 加 ➕ / 减 ➖ / 平 ✅。摊平信号在图标前加 ⚠️，标题后缀「（摊平）」。
 
+### §7.1 X 推文
+
+```
+🐦 熬鹰资本 · @thankUcrypto 新推文 2 条
+
+2026-11-14 01:01:50
+MSTR被移出指数前，买了点PUT。
+今天一看，旅游经费赚回来了。 。
+（1 张图）
+https://x.com/thankUcrypto/status/2121287435242058003
+
+2026-11-14 21:19:03
+周末的暴跌可以抄，周末的阴跌不能碰。
+暴跌是突然的清算，阴跌是有纪律的出货，阴跌抄底你抄了，人家机构出得更舒服，何必呢？
+https://x.com/thankUcrypto/status/2121593758101942747
+```
+
+超过单条上限时自动拆分，标题变为「新推文（1/2）」「新推文（2/2）」。媒体只提示「（N 张图）」或
+「（含视频）」，不在 Telegram 内展开；链接预览保持关闭。
+
 ## §8 持久化
 
-SQLite（`node:sqlite`），表：`trader`（含 `disabled_reason`）、`lead_order`、`closed_position`、`ledger`、`order_snapshot`、`signal`、`health`。`PRAGMA user_version` 做迁移版本，`busy_timeout=5000`。
+SQLite（`node:sqlite`），表：`trader`（含 `disabled_reason`）、`lead_order`、`closed_position`、`ledger`、`order_snapshot`、`signal`、`health`、`tweet_state`。`PRAGMA user_version` 做迁移版本，`busy_timeout=5000`。
 
 - 订单先入库再渲染，信号先入库再发送；订单、信号、账本、快照在同一个事务里提交。
 - `signal.sent_at` 为 null 表示待发；`-1` 表示永久失败已跳过；shadow 模式下写入时即标记为已处理，
@@ -182,18 +218,23 @@ Telegram Bot API `sendMessage`，纯文本。
 
 - 只重试明确未送达的错误：429 和请求发出前的连接失败（ECONNREFUSED / ENOTFOUND / EAI_AGAIN / UND_ERR_CONNECT_TIMEOUT）。
 - 超时、连接重置、5xx 不重试，交给 outbox 下一轮补发（幂等键保证不重复）。
+- 同一轮先发交易信号，再发 X 推文；推文与信号共用 outbox，按 `created_at`、`rowid` 升序，失败下轮补发。
+- 只有 order / transfer 信号真正送达才触发推文；健康告警和推文自身不触发。
+- 推文消息的永久失败（4xx）与普通信号一致：标记 `sent_at = -1` 跳过，不堵队列。
 
 ## §10 多交易员
 
 `config/traders.yaml` 的 `traders` 数组，每人独立：轮询间隔、账本、游标、失败计数、outbox。
 
 - 新增一人：复制一段配置，填 `portfolioId`（带单页 URL 末尾数字）。
+- 可选 `xHandle`：填了之后，该交易员的 order / transfer 信号送达时，补推他 X 上的新推文；
+  `xMaxTweetsPerPush` 控制单次最多条数（默认 10）。推文游标按交易员独立持久化。
 - 首次启动自动 bootstrap（回补 `bootstrapDays` 天，静默入库），不会把历史刷屏。
 - 多人的首轮自动错开，避免同时打接口。
 
 ## §11 验收
 
-1. `npm run typecheck`、`npm test` 全绿（35 个测试）。
+1. `npm run typecheck`、`npm test` 全绿（49 个测试）。
 2. 回放 14 天真实订单：拉取 60 笔（含 3 笔同毫秒 ETH 委托），锚定后只剩 NVDA LONG 3206.99 一个未平仓；
    BTC 动作序列为 open→close→open→add→close。
 3. 平仓消息的入场价、杠杆、ROI、持有时间来自 `position-history`，与订单的 `totalPnl` 对得上；
@@ -202,6 +243,8 @@ Telegram Bot API `sendMessage`，纯文本。
 5. 可跟性：0.1% 深度按方向取对手盘；本单占 39% 判「一般」；中位持仓 <60 分钟出短线警告。
 6. 拔掉代理跑一轮：不推进游标、不产生假信号、连续 3 次后出告警（告警不等恢复就发）。
 7. shadow 48 小时：与 `trade-history` 交叉核对漏单为 0，统计首次发现延迟 p50/p90。
+8. 信号后推文：首次运行静默建立基线；一条信号后只推新增推文，重复运行不重发；
+   推文接口故障时信号照常送达，恢复后补推。
 
 ## §12 已知限制
 
@@ -209,3 +252,5 @@ Telegram Bot API `sendMessage`，纯文本。
 2. `order-history` 单次最多 100 条、可回溯约 30 天；`trade-history` 约 6000 条。极端高频带单员可能超窗口。
 3. 一个仓位分多笔平掉时，多笔订单会匹配到同一条 `position-history`，杠杆/ROI 相同，盈亏按订单各自计算。
 4. 推定持仓在「启动前已有存量仓」时不准确，这是数据源限制。
+5. X 推文依赖第三方镜像 fxtwitter：失效时只记日志，不单独发告警；图片/视频只有数量提示，
+   不展开媒体；引用帖只显示他自己的正文和原帖链接，不展开被引用内容。
