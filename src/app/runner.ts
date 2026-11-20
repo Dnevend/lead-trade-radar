@@ -132,6 +132,18 @@ export class TraderRunner {
     log("bootstrap 完成", { trader: this.trader.id, orders: sorted.length, lastSeen });
   }
 
+  /** 把游标推到当前，确保正式轮询不会补拉更早的订单（保留 120s 重叠用于补查迟到订单）。 */
+  alignCursorToNow(): void {
+    const { store, now, log } = this.deps;
+    const trader = store.getTrader(this.trader.id);
+    if (!trader?.bootstrapDone) {
+      return;
+    }
+    const target = now();
+    store.upsertTrader({ ...trader, lastSeenMs: target });
+    log("游标对齐当前时刻", { trader: this.trader.id, lastSeen: target });
+  }
+
   /** 跑一轮，返回本轮新产生的信号文本（便于 CLI 预览）。 */
   async cycle(): Promise<string[]> {
     const { store, client, now, log, push, notifier } = this.deps;

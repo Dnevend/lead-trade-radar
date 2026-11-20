@@ -56,13 +56,25 @@ const enabledTraders = config.traders
     }
     return true;
   });
-const runners = enabledTraders.map(
-  (trader) =>
-    new TraderRunner(
-      { store, client, notifier, push, bootstrapDays: config.bootstrapDays, now: Date.now, log, priceOf, depthOf, tweetSource },
-      trader,
-    ),
-);
+const runners = enabledTraders.map((trader) => makeRunner(trader, { push, notifier }));
+
+function makeRunner(trader: TraderConfig, options: { push: boolean; notifier: TelegramClient | null }): TraderRunner {
+  return new TraderRunner(
+    {
+      store,
+      client,
+      notifier: options.notifier,
+      push: options.push,
+      bootstrapDays: config.bootstrapDays,
+      now: Date.now,
+      log,
+      priceOf,
+      depthOf,
+      tweetSource,
+    },
+    trader,
+  );
+}
 
 const timers = new Map<string, NodeJS.Timeout>();
 let keepalive: NodeJS.Timeout | null = null;
@@ -93,6 +105,36 @@ async function startTrader(runner: TraderRunner, trader: TraderConfig, index: nu
       }
       await sleep(30_000);
     }
+  }
+  if (stopping) return;
+
+  // 重开时先按 shadow 语义静默追平停机期间的订单/划转：账本连续，但不补推历史。
+  if (config.skipBacklogOnStart && push) {
+    const silent = makeRunner(trader, { push: false, notifier: null });
+    // 追平完成前不进入正式轮询，避免任何积压落到会推送的那条路径上。
+    while (!stopping) {
+      try {
+        let signals = 0;
+        // 停机很久时一次分页拉不全，循环到没有新单为止；上限防止死循环。
+        for (let round = 0; round < 10; round += 1) {
+          const missed = await silent.cycle();
+          signals += missed.length;
+          if (missed.length === 0) break;
+        }
+        log("启动静默追平", { trader: trader.id, signals });
+        break;
+      } catch (error) {
+        log("启动静默追平失败", { trader: trader.id, error: String(error) });
+        if (isProjectClosed(error)) {
+          await runner.disable("带单项目已关闭（11012030）");
+          return;
+        }
+        await sleep(30_000);
+      }
+    }
+    if (stopping) return;
+    // 兜底：把正式轮询的起点钉在当前，宁可漏数据也绝不补推历史。
+    runner.alignCursorToNow();
   }
   if (stopping) return;
 

@@ -230,6 +230,8 @@ Telegram Bot API `sendMessage`，纯文本。
 - 可选 `xHandle`：填了之后，该交易员的 order / transfer 信号送达时，补推他 X 上的新推文；
   `xMaxTweetsPerPush` 控制单次最多条数（默认 10）。推文游标按交易员独立持久化。
 - 首次启动自动 bootstrap（回补 `bootstrapDays` 天，静默入库），不会把历史刷屏。
+- `skipBacklogOnStart: true` 时，重启后先用 shadow 语义静默追平停机期间的数据：订单/划转照常入库、
+  账本连续，但标记为已处理；追平后把游标对齐当前，不补推历史，只有启动后的新单才推送。
 - 多人的首轮自动错开，避免同时打接口。
 
 ## §11 验收

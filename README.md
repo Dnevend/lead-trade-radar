@@ -42,6 +42,7 @@ npm run tweets
 pollSeconds: 60
 bootstrapDays: 14
 push: false          # true 才会发 Telegram
+skipBacklogOnStart: false  # true = 启动时静默追平停机期间的数据，不补推历史
 
 traders:
   - id: aoying

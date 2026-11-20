@@ -359,6 +359,97 @@ describe("轮询编排", () => {
     expect(text).toContain("ECONNREFUSED");
     expect(text).toContain("127.0.0.1:7890");
   });
+
+  it("skipBacklogOnStart：停机期间的订单静默入库，重开不补推", async () => {
+    const store = new Store(":memory:");
+    const positions = loadPositions();
+    const detail = loadDetail();
+    const traderConfig = { id: "aoying", portfolioId: detail.leadPortfolioId, label: detail.nickname, enabled: true };
+
+    const lastSeen = 1_794_600_000_000;
+    store.upsertTrader({
+      id: "aoying",
+      portfolioId: detail.leadPortfolioId,
+      label: detail.nickname,
+      lastSeenMs: lastSeen,
+      bootstrapDone: true,
+      disabledReason: null,
+    });
+
+    // 停机期间（最后游标之后）成交两笔
+    const missed: LeadOrder[] = [
+      newLeadOrder(lastSeen, 3_600_000),
+      { ...newLeadOrder(lastSeen, 7_200_000), executedQty: 11 },
+    ];
+    // 一笔“分页没拉到”的积压：静默追平没覆盖到，但也不能在正式轮询里被补推。
+    const straggler = newLeadOrder(lastSeen, 10_800_000);
+    let includeStraggler = false;
+    const client = {
+      async fetchDetail() {
+        return detail;
+      },
+      async fetchClosedPositions() {
+        return positions;
+      },
+      async fetchOrders(_portfolioId: string, startTime: number, endTime: number) {
+        const all = includeStraggler ? [...missed, straggler] : missed;
+        return all.filter((o) => o.orderUpdateTime >= startTime && o.orderUpdateTime <= endTime);
+      },
+      async fetchTransfers() {
+        return [];
+      },
+    } as unknown as BapiClient;
+
+    const sent: string[] = [];
+    const notifier = {
+      async sendMessage(text: string) {
+        sent.push(text);
+        return { messageId: sent.length };
+      },
+    };
+
+    // 启动时的 shadow 追平轮：信号照常渲染入库，但一条都不发
+    const silent = new TraderRunner(
+      {
+        store,
+        client,
+        notifier,
+        push: false,
+        bootstrapDays: 14,
+        now: () => lastSeen + 86_400_000,
+        log: () => {},
+      },
+      traderConfig,
+    );
+    const emitted = await silent.cycle();
+    expect(emitted).toHaveLength(2);
+    expect(sent).toHaveLength(0);
+    expect(store.listPendingSignals()).toHaveLength(0);
+    expect(store.listSignals(10).every((row) => row.sentAt !== null)).toBe(true);
+    expect(store.getTrader("aoying")!.lastSeenMs).toBe(lastSeen + 7_200_000);
+
+    // 兜底：追平后把游标对齐当前，分页没拉到的积压也不会在正式轮询里补推
+    includeStraggler = true;
+    silent.alignCursorToNow();
+    expect(store.getTrader("aoying")!.lastSeenMs).toBe(lastSeen + 86_400_000);
+
+    // 随后常驻 runner 正常轮询：停机期间的订单已入库，不会补推
+    const live = new TraderRunner(
+      {
+        store,
+        client,
+        notifier,
+        push: true,
+        bootstrapDays: 14,
+        now: () => lastSeen + 86_400_060_000,
+        log: () => {},
+      },
+      traderConfig,
+    );
+    expect(await live.cycle()).toHaveLength(0);
+    expect(sent).toHaveLength(0);
+    store.close();
+  });
 });
 
 function xTweet(id: string, text = `tweet ${id}`): Tweet {

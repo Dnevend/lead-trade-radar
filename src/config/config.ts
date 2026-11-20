@@ -25,6 +25,8 @@ const configSchema = z.object({
   pollSeconds: z.number().int().min(30).default(60),
   bootstrapDays: z.number().int().min(1).max(30).default(14),
   push: z.boolean().default(false),
+  /** true = 启动时把停机期间的订单/划转静默入库，不补推历史，只推启动后的新单。 */
+  skipBacklogOnStart: z.boolean().default(false),
   traders: z.array(traderSchema).min(1),
 });
 

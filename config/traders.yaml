@@ -5,6 +5,8 @@ pollSeconds: 60
 bootstrapDays: 14
 # true 才会真的发 Telegram；shadow 阶段保持 false。
 push: true
+# true = 启动时把停机期间的订单/划转静默入库（账本连续），但不补推历史，只推启动后的新单。
+skipBacklogOnStart: true
 
 traders:
   - id: aoying
